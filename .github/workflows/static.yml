@@ -21,10 +21,17 @@ jobs:
       name: github-pages
       url: https://markfml.github.io/debrief-generator/
     steps:
+      - name: Debug environment
+        run: |
+          echo "Runtime URL present: $([ -n "$ACTIONS_RUNTIME_URL" ] && echo YES || echo NO)"
+          echo "Runtime URL: $ACTIONS_RUNTIME_URL"
+          echo "Run ID: $GITHUB_RUN_ID"
+          echo "OIDC URL present: $([ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ] && echo YES || echo NO)"
+
       - name: Checkout
         run: |
           git clone --depth 1 "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" _site
-          echo "Files cloned:"
+          echo "Checkout done, files:"
           ls _site/
 
       - name: Create artifact tarball
@@ -41,11 +48,9 @@ jobs:
 
       - name: Upload artifact to GitHub Actions
         id: upload
-        env:
-          ACTIONS_RUNTIME_URL: ${{ env.ACTIONS_RUNTIME_URL }}
-          ACTIONS_RUNTIME_TOKEN: ${{ env.ACTIONS_RUNTIME_TOKEN }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
+          echo "ACTIONS_RUNTIME_URL=$ACTIONS_RUNTIME_URL"
+          
           # Create artifact container
           CREATE_RESP=$(curl -sS -X POST \
             -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
@@ -54,48 +59,50 @@ jobs:
             -d '{"Type":"actions_storage","Name":"github-pages"}' \
             "${ACTIONS_RUNTIME_URL}_apis/pipelines/workflows/${GITHUB_RUN_ID}/artifacts?api-version=6.0-preview")
           echo "Create response: $CREATE_RESP"
+          
           FILE_URL=$(echo "$CREATE_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['fileContainerResourceUrl'])")
-          echo "File URL: $FILE_URL"
           ARTIFACT_ID=$(echo "$CREATE_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['containerId'])")
+          echo "File URL: $FILE_URL"
+          echo "Artifact ID: $ARTIFACT_ID"
           echo "artifact-id=$ARTIFACT_ID" >> $GITHUB_OUTPUT
           
           # Upload the file
           FILE_SIZE=$(stat -c%s /tmp/artifact.tar)
           FILE_MD5=$(md5sum /tmp/artifact.tar | cut -d' ' -f1 | xxd -r -p | base64)
-          curl -sS -X PUT \
+          UPLOAD_RESP=$(curl -sS -X PUT \
             -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
             -H "Content-Type: application/octet-stream" \
             -H "x-tfs-filelength: $FILE_SIZE" \
             -H "x-actions-results-md5: $FILE_MD5" \
             "${FILE_URL}?itemPath=artifact.tar" \
-            --data-binary @/tmp/artifact.tar
-          echo "Upload complete"
+            --data-binary @/tmp/artifact.tar)
+          echo "Upload response: $UPLOAD_RESP"
           
           # Finalize artifact
-          curl -sS -X PATCH \
+          FINALIZE_RESP=$(curl -sS -X PATCH \
             -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
             -H "Content-Type: application/json" \
             -H "Accept: application/json;api-version=6.0-preview.1" \
             -d "{\"size\": $FILE_SIZE}" \
-            "${ACTIONS_RUNTIME_URL}_apis/pipelines/workflows/${GITHUB_RUN_ID}/artifacts?api-version=6.0-preview&artifactName=github-pages"
-          echo "Finalized"
+            "${ACTIONS_RUNTIME_URL}_apis/pipelines/workflows/${GITHUB_RUN_ID}/artifacts?api-version=6.0-preview&artifactName=github-pages")
+          echo "Finalize response: $FINALIZE_RESP"
 
       - name: Get OIDC token
         id: oidc
         run: |
-          TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api.github.com" | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])")
+          TOKEN=$(curl -sS \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api.github.com" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])")
           echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          echo "Got OIDC token: $([ -n "$TOKEN" ] && echo YES || echo NO)"
 
       - name: Deploy Pages
-        env:
-          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
         run: |
           DEPLOY_RESP=$(curl -sS -X POST \
-            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Authorization: Bearer ${{ steps.oidc.outputs.token }}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             -d "{\"artifact_id\":${{ steps.upload.outputs.artifact-id }},\"pages_build_version\":\"${{ github.sha }}\"}" \
             "https://api.github.com/repos/${{ github.repository }}/pages/deployments")
-          echo "$DEPLOY_RESP"
-          PAGE_URL=$(echo "$DEPLOY_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('page_url',''))" 2>/dev/null || echo "")
-          echo "Page URL: $PAGE_URL"
+          echo "Deploy response: $DEPLOY_RESP"
