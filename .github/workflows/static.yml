@@ -1,15 +1,101 @@
-name: Test no-action workflow
+name: Deploy to GitHub Pages
 
 on:
   push:
     branches: ["main"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
 jobs:
-  test:
+  deploy:
     runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: https://markfml.github.io/debrief-generator/
     steps:
-      - name: Echo test
-        run: echo "Hello World - workflow running!"
-      - name: List directory
-        run: ls -la
+      - name: Checkout
+        run: |
+          git clone --depth 1 "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" _site
+          echo "Files cloned:"
+          ls _site/
+
+      - name: Create artifact tarball
+        run: |
+          cd _site
+          tar \
+            --dereference --hard-dereference \
+            --directory "." \
+            -cvf /tmp/artifact.tar \
+            --exclude=.git \
+            --exclude=".github" \
+            .
+          echo "Tarball size: $(du -sh /tmp/artifact.tar)"
+
+      - name: Upload artifact to GitHub Actions
+        id: upload
+        env:
+          ACTIONS_RUNTIME_URL: ${{ env.ACTIONS_RUNTIME_URL }}
+          ACTIONS_RUNTIME_TOKEN: ${{ env.ACTIONS_RUNTIME_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          # Create artifact container
+          CREATE_RESP=$(curl -sS -X POST \
+            -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json;api-version=6.0-preview.1" \
+            -d '{"Type":"actions_storage","Name":"github-pages"}' \
+            "${ACTIONS_RUNTIME_URL}_apis/pipelines/workflows/${GITHUB_RUN_ID}/artifacts?api-version=6.0-preview")
+          echo "Create response: $CREATE_RESP"
+          FILE_URL=$(echo "$CREATE_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['fileContainerResourceUrl'])")
+          echo "File URL: $FILE_URL"
+          ARTIFACT_ID=$(echo "$CREATE_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['containerId'])")
+          echo "artifact-id=$ARTIFACT_ID" >> $GITHUB_OUTPUT
+          
+          # Upload the file
+          FILE_SIZE=$(stat -c%s /tmp/artifact.tar)
+          FILE_MD5=$(md5sum /tmp/artifact.tar | cut -d' ' -f1 | xxd -r -p | base64)
+          curl -sS -X PUT \
+            -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            -H "x-tfs-filelength: $FILE_SIZE" \
+            -H "x-actions-results-md5: $FILE_MD5" \
+            "${FILE_URL}?itemPath=artifact.tar" \
+            --data-binary @/tmp/artifact.tar
+          echo "Upload complete"
+          
+          # Finalize artifact
+          curl -sS -X PATCH \
+            -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json;api-version=6.0-preview.1" \
+            -d "{\"size\": $FILE_SIZE}" \
+            "${ACTIONS_RUNTIME_URL}_apis/pipelines/workflows/${GITHUB_RUN_ID}/artifacts?api-version=6.0-preview&artifactName=github-pages"
+          echo "Finalized"
+
+      - name: Get OIDC token
+        id: oidc
+        run: |
+          TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api.github.com" | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])")
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Deploy Pages
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          DEPLOY_RESP=$(curl -sS -X POST \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -d "{\"artifact_id\":${{ steps.upload.outputs.artifact-id }},\"pages_build_version\":\"${{ github.sha }}\"}" \
+            "https://api.github.com/repos/${{ github.repository }}/pages/deployments")
+          echo "$DEPLOY_RESP"
+          PAGE_URL=$(echo "$DEPLOY_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('page_url',''))" 2>/dev/null || echo "")
+          echo "Page URL: $PAGE_URL"
